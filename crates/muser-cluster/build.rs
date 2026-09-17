@@ -28,6 +28,13 @@ fn main() {
         );
         build.include(format!("{dext_dir}/usermode/libibverbs_compat/include"));
         println!("cargo:rustc-link-search=native={dext_dir}/build");
+        // The link search path is a build-time lookup; without an rpath the
+        // linked binary has no LC_RPATH at all and dyld fails the load with
+        // "Library not loaded: @rpath/libibverbs.dylib" the moment it runs.
+        // MelonDMA's shim is not installed into a system library directory --
+        // it lives in the checkout -- so the same directory has to be recorded
+        // for runtime too, exactly as MelonDMA's own tools do it.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dext_dir}/build");
     }
     println!("cargo:rustc-link-lib=dylib=ibverbs");
 

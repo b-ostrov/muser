@@ -27,16 +27,24 @@
 #include <infiniband/verbs.h>
 
 #define MELON_RDMA_CHUNK (256 * 1024)
-/* RX ring is one single MR covering RX_DEPTH*CHUNK bytes. Both 16*256KiB=4MiB
- * and 8*256KiB=2MiB hit a registration ceiling in the macOS DriverKit compat
- * shim (reg_mr failed, kr=0xe00002c2) that 4*256KiB=1MiB does not — looks
- * like a DMA/IOMemoryDescriptor mapping constraint tied to allocation size
- * or layout, not a simple byte-count cap (root cause not yet isolated;
- * worth a follow-up). Left at the proven-safe depth. TX generations are
- * registered as separate 256KiB MRs each regardless of window depth, so
- * TX_WINDOW's much deeper pipelining below is not constrained by this same
- * ceiling — and TX depth is what the real streaming-send bottleneck needs. */
-#define MELON_RDMA_RX_DEPTH 4
+/* RX ring is one single MR covering RX_DEPTH*CHUNK bytes, and it must be as
+ * deep as TX_WINDOW: a sender that can have 16 SENDs in flight against a
+ * 4-slot receive queue runs the receiver dry and takes an RNR NAK plus a
+ * retry round trip for the rest of the burst. Measured Mac<-GX10 on 64 KiB
+ * writes, which is the size muser's own per-layer streaming actually posts:
+ * depth 4 settles at 18.6-21.6 Gbit/s and opens at 13.7, depth 16 holds
+ * 22.85 with no ramp. At 256 KiB writes both saturate the link, so the
+ * shallow ring only shows up on the small-segment pattern that matters here.
+ *
+ * This used to be pinned at 4 because 2 MiB and 4 MiB single registrations
+ * failed in the macOS DriverKit compat shim (reg_mr, kr=0xe00002c2) while
+ * 1 MiB succeeded. That ceiling is gone: the shim now falls back to chunked
+ * children composed into one indirect MR above RDMA_MAX_DIRECT_MR_BYTES
+ * (480 pages), and a single registration is verified good to 64 MiB on
+ * driver 0.547. */
+#ifndef MELON_RDMA_RX_DEPTH
+#define MELON_RDMA_RX_DEPTH 16
+#endif
 #define MELON_RDMA_IB_PORT 1
 
 /* Deep-pipelined TX, matching MelonDMA's own ggml-rpc/transport.cpp fix
@@ -58,7 +66,9 @@
  * whole request's worth of small segments can be in flight before send()
  * ever has to block, matching a TCP kernel send buffer's ability to
  * absorb a burst of small writes without per-write synchronization. */
+#ifndef MELON_RDMA_TX_WINDOW
 #define MELON_RDMA_TX_WINDOW 16
+#endif
 
 /* Send-side wr_id values are tagged with this high bit so they can never
  * collide with an RX slot index (0..MELON_RDMA_RX_DEPTH-1) on the shared CQ. */
@@ -165,6 +175,60 @@ struct bootstrap_wire {
     uint8_t gid[16];
 } __attribute__((packed));
 
+/* Resolves p->gid_index to an index whose GID this process can actually read,
+ * and returns that GID.
+ *
+ * A fixed index is only correct on a provider whose GID table is a property
+ * of the port. MelonDMA's is not: it programs one RoCE slot per client from
+ * MELONDMA_LOCAL_IP/_LOCAL_MAC/_REMOTE_MAC and answers ibv_query_gid only for
+ * the slot that client owns, handing every further client the next free one.
+ * So index 0 is right for whichever process opened the device first and wrong
+ * for all the rest — including this one, once anything else on the Mac is
+ * holding an RDMA link. Ask for the configured index, and if the provider
+ * will not answer for it, take the slot this process does own.
+ *
+ * Scanning is a fallback, never the first move: on a Linux port that answers
+ * for every index, index 0 is the link-local RoCE v1 GID, and silently
+ * choosing it over the caller's RoCE v2 index would put the two ends on
+ * different RoCE versions. The requested index is always tried first, so on
+ * Linux the scan never runs.
+ *
+ * ibv_query_gid returns an errno value; it does not set errno. Reporting
+ * strerror(errno) here used to print whatever unrelated call last failed. */
+static int resolve_local_gid(melon_rdma_pipe_t *p, const struct ibv_port_attr *port_attr,
+                             union ibv_gid *out) {
+    int rc = -1;
+    if (p->gid_index >= 0) {
+        rc = ibv_query_gid(p->ctx, p->ib_port, p->gid_index, out);
+        if (rc == 0) return 0;
+    }
+
+    int table_len = port_attr->gid_tbl_len;
+    if (table_len <= 0 || table_len > 256) table_len = 256;
+    for (int i = 0; i < table_len; i++) {
+        if (i == p->gid_index) continue; /* already tried */
+        if (ibv_query_gid(p->ctx, p->ib_port, i, out) != 0) continue;
+        fprintf(stderr,
+                "melon_rdma: GID index %d is not readable by this process; "
+                "using index %d, the slot it owns\n", p->gid_index, i);
+        p->gid_index = i;
+        return 0;
+    }
+
+    if (p->gid_index >= 0)
+        set_error("ibv_query_gid(index=%d) failed: %s, and no other index in a "
+                  "%d-entry table answered either — on macOS this is what a "
+                  "missing MELONDMA_LOCAL_IP/MELONDMA_LOCAL_MAC/"
+                  "MELONDMA_REMOTE_MAC looks like, because the provider "
+                  "programs no slot for a client that did not configure RoCE",
+                  p->gid_index, strerror(rc), table_len);
+    else
+        set_error("no readable GID in a %d-entry table — on macOS this is what "
+                  "a missing MELONDMA_LOCAL_IP/MELONDMA_LOCAL_MAC/"
+                  "MELONDMA_REMOTE_MAC looks like", table_len);
+    return -1;
+}
+
 melon_rdma_pipe_t *melon_rdma_pipe_open(int bootstrap_fd, const char *dev_name, int gid_index) {
     melon_rdma_pipe_t *p = calloc(1, sizeof(*p));
     if (!p) {
@@ -209,10 +273,7 @@ melon_rdma_pipe_t *melon_rdma_pipe_open(int bootstrap_fd, const char *dev_name, 
     p->path_mtu = port_attr.active_mtu;
 
     union ibv_gid local_gid;
-    if (ibv_query_gid(p->ctx, p->ib_port, p->gid_index, &local_gid) != 0) {
-        set_error("ibv_query_gid(index=%d) failed: %s", p->gid_index, strerror(errno));
-        goto fail;
-    }
+    if (resolve_local_gid(p, &port_attr, &local_gid) != 0) goto fail;
     memcpy(p->local_gid, local_gid.raw, 16);
 
     p->pd = ibv_alloc_pd(p->ctx);
