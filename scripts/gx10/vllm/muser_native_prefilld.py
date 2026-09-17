@@ -582,6 +582,14 @@ def start_container(config: dict[str, Any]) -> Path:
         f"MUSER_RDMA_GID={os.environ.get('MUSER_RDMA_GID', '2')}",
         "-e",
         "MELON_RDMA_PIPE_LIB=/opt/muser/scripts/gx10/llamacpp/libmelon_rdma_pipe.so",
+        # Every RDMA registration is locked memory, and docker's default
+        # RLIMIT_MEMLOCK in this container is 8 MiB -- the pipe's 16 TX
+        # generations (4 MiB) plus its RX ring land exactly on that wall, so
+        # ibv_reg_mr fails with ENOMEM as soon as the RX ring is deep enough
+        # to match the TX window. The host and the systemd unit are already
+        # unlimited; only the container was not.
+        "--ulimit",
+        "memlock=-1",
         "--device=/dev/infiniband/uverbs0",
         "--device=/dev/infiniband/uverbs1",
         "--device=/dev/infiniband/uverbs2",
