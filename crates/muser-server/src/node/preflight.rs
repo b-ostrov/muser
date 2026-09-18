@@ -5,7 +5,7 @@
 //! probe that failed, not "preflight failed".
 
 use super::progress::{Status, Step};
-use super::registry::{NodeEntry, RECEIVER_PORT, STATE_PREFLIGHT_OK};
+use super::registry::{NodeEntry, ProducerKind, RECEIVER_PORT, STATE_PREFLIGHT_OK};
 use super::ssh::{validate_remote_path, Ssh};
 use super::{Ctx, Result};
 
@@ -380,6 +380,7 @@ pub fn run(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
     }
     let effective = ssh.effective_host();
     entry.connect_host = (effective != entry.host).then_some(effective);
+    resolve_rdma(ctx, &ssh, entry)?;
     entry.touch(STATE_PREFLIGHT_OK);
     entry.last_error = None;
     ctx.progress.emit(
@@ -519,6 +520,47 @@ fn free_space_probe_path(model_dir: &std::path::Path) -> Result<std::path::PathB
 /// The Mac's address as the node sees it — what the node dials back on.
 /// Taken from `$SSH_CLIENT`, so it is the route that already works rather
 /// than a guess from a local interface list.
+/// Re-reads the RDMA lane on every preflight that keeps or asks for one: the
+/// GID index is the one value that must never be remembered stale.
+fn resolve_rdma(ctx: &Ctx, ssh: &Ssh, entry: &mut NodeEntry) -> Result<()> {
+    let want = ctx.rdma_request.want.unwrap_or(entry.rdma.is_some());
+    if !want {
+        if entry.rdma.take().is_some() {
+            ctx.progress.emit(
+                Step::Preflight,
+                Status::Info,
+                "RDMA bulk lane removed; payloads will ride TLS",
+            );
+        }
+        return Ok(());
+    }
+    if entry.producer_kind() != ProducerKind::Native {
+        return Err("the RDMA bulk lane is enrolled for the native producer only;                     re-add with --producer native or --transport tcp"
+            .into());
+    }
+    if !cfg!(feature = "melon-rdma") {
+        return Err("this muser was built without the melon-rdma feature; rebuild with                     `--features melon-rdma` or re-add with --transport tcp"
+            .into());
+    }
+    let lane = super::rdma::discover(ssh, &ctx.rdma_request)?;
+    ctx.progress.emit_data(
+        Step::Preflight,
+        Status::Info,
+        &format!(
+            "RDMA bulk lane: node {} gid {} on {} ({}, {}) <-> this Mac {}",
+            lane.node_device,
+            lane.node_gid_index,
+            lane.node_netdev,
+            lane.node_address,
+            lane.node_mac,
+            lane.mac_address
+        ),
+        serde_json::json!({ "rdma": lane }),
+    );
+    entry.rdma = Some(lane);
+    Ok(())
+}
+
 pub fn advertised_receiver_host(ssh: &Ssh) -> Result<String> {
     let probes = parse(&ssh.run(PROBE, &[])?);
     validate_callback_address(&probes.ssh_client)

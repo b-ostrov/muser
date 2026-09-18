@@ -243,16 +243,59 @@ def write_frame(
     )
 
 
-def write_payload_frame(stream: ssl.SSLSocket, header: dict, payload: bytes) -> int:
-    """Write one payload frame and return only time spent pushing it to TLS."""
+def write_payload_frame(stream: "Wire | ssl.SSLSocket", header: dict, payload: bytes) -> int:
+    """Write one payload frame and return only the time spent pushing it out.
+
+    On a negotiated bulk lane the payload is posted to RDMA and the frame
+    carries a `bulk` reference instead of the bytes. The time returned is then
+    only what the put blocked on credit; the receipt's wire time comes from
+    the lane itself (see bulk_wire_time), not from summing these."""
     if not payload:
         raise ProtocolError("payload frame cannot be empty")
+    lane = getattr(stream, "lane", None)
     started = time.perf_counter_ns()
-    write_frame(stream, header, payload)
-    elapsed = time.perf_counter_ns() - started
+    if lane is not None:
+        index, position = lane.put(payload, stream.timeout_ms)
+        elapsed = time.perf_counter_ns() - started
+        write_frame(
+            stream,
+            {**header, "bulk": {"index": index, "position": position, "length": len(payload)}},
+        )
+    else:
+        write_frame(stream, header, payload)
+        elapsed = time.perf_counter_ns() - started
     if elapsed <= 0:
         raise ProtocolError("payload wire timer did not advance")
     return elapsed
+
+
+def drain_wire(stream: "Wire | ssl.SSLSocket") -> int:
+    """Before the seal: wait for every posted RDMA write to complete. Returns
+    the wait for callers that account it; a no-op for inline payloads, which
+    TLS has already pushed by the time sendall returns."""
+    lane = getattr(stream, "lane", None)
+    if lane is None:
+        return 0
+    started = time.perf_counter_ns()
+    lane.flush(stream.timeout_ms)
+    return time.perf_counter_ns() - started
+
+
+def bulk_wire_time(stream: "Wire | ssl.SSLSocket") -> tuple[int, str] | None:
+    """(payload wire ns, receipt tag) for a transfer whose payloads crossed the
+    bulk lane, or None for inline payloads.
+
+    Summing how long each put blocked would be the wrong number: a put only
+    blocks when the ring is full, so a lane that keeps up reports almost no
+    time and an impossible rate. What the link actually spent is the union of
+    [post, completion] over every write — TCP_INFO busy time's counterpart —
+    exact when the NIC stamps completions."""
+    lane = getattr(stream, "lane", None)
+    if lane is None:
+        return None
+    wire_ns, hardware = lane.wire_ns()
+    tag = "melon-rdma-bulk-nic-busy-time-v1" if hardware else "melon-rdma-bulk-reaped-busy-time-v1"
+    return wire_ns, tag
 
 
 def read_frame(stream: ssl.SSLSocket) -> tuple[dict, bytes]:
@@ -343,58 +386,103 @@ def connect_tls(args: argparse.Namespace) -> ssl.SSLSocket:
     return stream
 
 
-def connect_rdma_tls(args: argparse.Namespace):
-    """RDMA counterpart of `connect_tls()`: identical TLS 1.3 config,
-    identical ALPN/leaf-pin verification, but ciphertext moves over
-    MelonDMA's RDMA transport (see `melon_rdma_stream.py`) instead of a
-    plain TCP socket. Returns a `MelonRdmaTlsStream`, which exposes the same
-    `.recv()`/`.sendall()`/`.getpeercert()`/`.selected_alpn_protocol()`
-    /`.shutdown()`/`.close()` surface `connect_tls()`'s `ssl.SSLSocket` does,
-    so every call site above this function is unchanged."""
+class Wire:
+    """The mTLS control stream, plus the RDMA bulk lane when one was agreed.
+
+    Socket-shaped calls go to the TLS stream, so every framing helper works on
+    either; only write_payload_frame and drain_wire look at the lane."""
+
+    def __init__(self, tls: ssl.SSLSocket, lane, timeout_seconds: int) -> None:
+        self.tls = tls
+        self.lane = lane
+        self.timeout_ms = max(1, int(timeout_seconds * 1000))
+
+    def __getattr__(self, name: str):
+        return getattr(self.tls, name)
+
+    def close(self) -> None:
+        try:
+            if self.lane is not None:
+                self.lane.close()
+                self.lane = None
+        finally:
+            self.tls.close()
+
+
+def rdma_required() -> bool:
+    return os.environ.get("MUSER_RDMA_REQUIRED", "0") not in ("", "0")
+
+
+def open_bulk_lane(tls: ssl.SSLSocket, args: argparse.Namespace):
+    """Offer the RDMA bulk lane on a fresh TLS stream, before Begin.
+
+    Returns the connected sender, or None to keep payloads inline. Every way
+    of ending up inline says so on stderr — an RDMA link that quietly carries
+    nothing is a failure this project has already paid for more than once —
+    and MUSER_RDMA_REQUIRED=1 turns each of them into an error instead."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from melon_rdma_stream import MelonRdmaError, MelonRdmaStream, MelonRdmaTlsStream
+    from melon_rdma_bulk import MelonBulkError, MelonBulkSender
 
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.minimum_version = ssl.TLSVersion.TLSv1_3
-    context.maximum_version = ssl.TLSVersion.TLSv1_3
-    context.load_verify_locations(cafile=args.ca_cert)
-    context.load_cert_chain(args.client_cert, args.client_key)
-    context.set_alpn_protocols([ALPN])
+    def inline(reason: str):
+        if rdma_required():
+            raise ProtocolError(f"RDMA bulk lane is required: {reason}")
+        print(f"muser-v2-send: RDMA bulk lane unavailable, payloads stay on TLS: {reason}",
+              file=sys.stderr, flush=True)
+        return None
 
-    raw = socket.create_connection(
-        (args.receiver_host, args.receiver_port), timeout=args.timeout_seconds
-    )
     try:
-        rdma_stream = MelonRdmaStream(raw, args.rdma_dev, args.rdma_gid)
-    except MelonRdmaError:
-        raw.close()
-        raise
-    stream = MelonRdmaTlsStream(rdma_stream, context, args.server_name)
+        lane = MelonBulkSender(args.rdma_dev, args.rdma_gid)
+    except MelonBulkError as error:
+        return inline(str(error))
+    try:
+        write_frame(tls, {"kind": "bulk_offer", "endpoint": lane.endpoint().hex()})
+        try:
+            header, payload = read_frame(tls)
+        except (ProtocolError, OSError, ssl.SSLError) as error:
+            lane.close()
+            raise ProtocolError(
+                "receiver closed the stream on bulk_offer — it predates the RDMA bulk "
+                f"lane; upgrade it or run the producer with MUSER_TRANSPORT=tcp ({error})"
+            ) from error
+        kind = header.get("kind")
+        if payload or kind not in ("bulk_accept", "bulk_decline"):
+            lane.close()
+            raise ProtocolError(f"receiver answered bulk_offer with {header!r}")
+        if kind == "bulk_decline":
+            lane.close()
+            return inline(f"receiver declined: {header.get('reason')}")
+        endpoint = header.get("endpoint")
+        if not isinstance(endpoint, str) or len(endpoint) != 128:
+            lane.close()
+            raise ProtocolError("receiver bulk endpoint is malformed")
+        lane.connect(bytes.fromhex(endpoint))
+    except MelonBulkError as error:
+        lane.close()
+        # The receiver already agreed and is waiting on its ring; falling back
+        # now would leave it expecting writes that never come, so this fails.
+        raise ProtocolError(f"RDMA bulk lane failed after the receiver accepted it: {error}") from error
+    print(f"muser-v2-send: RDMA bulk lane up on {args.rdma_dev} gid {lane.gid_index}",
+          file=sys.stderr, flush=True)
+    return lane
 
-    if stream.selected_alpn_protocol() != ALPN:
-        stream.close()
-        raise ProtocolError("receiver did not negotiate the exact Muser ALPN")
-    leaf = stream.getpeercert(binary_form=True)
-    actual_leaf = sha256(leaf) if leaf is not None else "absent"
-    if actual_leaf != args.server_leaf_sha256:
-        stream.close()
-        raise ProtocolError(
-            f"receiver TLS leaf pin mismatch (presented {actual_leaf})"
-        )
-    return stream
 
+def connect_wire(args: argparse.Namespace) -> Wire:
+    """mTLS to the receiver, then — with --transport rdma — the bulk lane.
 
-def connect_wire(args: argparse.Namespace):
-    """Dispatches to `connect_tls()` (default) or `connect_rdma_tls()`
-    depending on `--transport`. Both return a stream exposing the same
-    surface, so every caller of the old `connect_tls(args)` call sites can
-    call this instead without further changes."""
+    Control frames always ride TLS over TCP; the transport choice only decides
+    where segment payload bytes go."""
     transport = getattr(args, "transport", "tcp")
+    if transport not in ("tcp", "rdma"):
+        raise ProtocolError(f"unknown --transport {transport!r}")
+    tls = connect_tls(args)
+    lane = None
     if transport == "rdma":
-        return connect_rdma_tls(args)
-    if transport == "tcp":
-        return connect_tls(args)
-    raise ProtocolError(f"unknown --transport {transport!r}")
+        try:
+            lane = open_bulk_lane(tls, args)
+        except BaseException:
+            tls.close()
+            raise
+    return Wire(tls, lane, args.timeout_seconds)
 
 
 @dataclass(frozen=True)
@@ -811,9 +899,10 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--transport",
         choices=("tcp", "rdma"),
         default=os.environ.get("MUSER_TRANSPORT", "tcp"),
-        help="data-leg wire transport: 'tcp' (default, unchanged) or 'rdma' "
-        "(MelonDMA RDMA byte-pipe under the same TLS 1.3/ALPN/leaf-pin/HMAC "
-        "stack). Also settable via MUSER_TRANSPORT.",
+        help="where segment payloads travel: 'tcp' (inline on the mTLS stream, "
+        "the default) or 'rdma' (the MelonDMA RoCE bulk lane, offered to the "
+        "receiver and used only if it accepts). Control, seal and ACK stay on "
+        "mTLS either way. Also settable via MUSER_TRANSPORT.",
     )
     parser.add_argument(
         "--rdma-dev",
@@ -823,11 +912,11 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser.add_argument(
         "--rdma-gid",
         type=int,
-        default=int(os.environ.get("MUSER_RDMA_GID", "2")),
-        help="local RoCEv1 GID table index for --transport rdma (also "
-        "MUSER_RDMA_GID) — re-verify with `ibv_devinfo -v` before trusting "
-        "a previously-known value; this table has drifted once already on "
-        "this hardware (a bonded interface moved it from index 4 to 2).",
+        default=int(os.environ.get("MUSER_RDMA_GID", "-1")),
+        help="RoCE v2 GID index of the cabled RDMA address for --transport "
+        "rdma (also MUSER_RDMA_GID). `muser node add --transport rdma` reads it "
+        "from sysfs; there is no safe default, because on Linux index 0 is the "
+        "link-local RoCE v1 entry.",
     )
     parser.add_argument("--ca-cert", required=True)
     parser.add_argument("--client-cert", required=True)
@@ -1019,17 +1108,6 @@ class DeferredHandoffV2Sender:
         self._key = load_mac_key(args.hmac_key_file)
         self._transfer_start_unix_ns = time.time_ns()
         self._wire = connect_wire(args)
-        # RDMA has no TCP_INFO-equivalent kernel busy-time counter to read
-        # (linux_tcp_busy_time_us() always returns None for it — no
-        # .getsockopt()), so it always takes the wall-clock sendall-blocked
-        # fallback below. That fallback is not a lesser measurement for
-        # RDMA specifically: melon_rdma_pipe.c's send() blocks synchronously
-        # on each operation's own completion, so the wall-clock delta IS the
-        # wire time, not an estimate padded with unrelated app think-time
-        # the way it would be for a buffered TCP write. Tagged with its own
-        # source string so validate_producer_receipt can tell the two
-        # fallback cases apart rather than accepting either silently.
-        self._transport_is_rdma = getattr(args, "transport", "tcp") == "rdma"
         self._descriptors: list[dict] = []
         self._payload_stream = hashlib.sha256()
         self._total = 0
@@ -1141,6 +1219,7 @@ class DeferredHandoffV2Sender:
         self._send_deferred_dflash()
         if self.next_intent is not None:
             raise ProtocolError("cannot seal an incomplete Muse transfer")
+        drain_wire(self._wire)
         seal = build_seal(
             self._begin,
             self._descriptors,
@@ -1158,14 +1237,13 @@ class DeferredHandoffV2Sender:
         ):
             raise ProtocolError("receiver ACK identity differs from the committed generation")
         payload_wire_ns = self._payload_wire_ns
-        if self._transport_is_rdma:
-            # melon_rdma_pipe.c's send() is synchronous per operation (blocks
-            # on that operation's own CQE), so self._payload_wire_ns is
-            # already exact wire time — there is no kernel counter to prefer
-            # it over the way there is for TCP.
-            payload_wire_source = "melon-rdma-sendall-blocked-time-v1"
+        lane_time = bulk_wire_time(self._wire)
+        if lane_time is not None:
+            # The TCP socket only carried control frames, so its kernel busy
+            # time says nothing about the payload; the lane measures its own.
+            payload_wire_ns, payload_wire_source_tag = lane_time
         else:
-            payload_wire_source = "sendall-blocked-time-v1"
+            payload_wire_source_tag = "sendall-blocked-time-v1"
             payload_busy_end_us = linux_tcp_busy_time_us(self._wire)
             if (
                 self._payload_busy_start_us is not None
@@ -1175,7 +1253,7 @@ class DeferredHandoffV2Sender:
                 payload_wire_ns = (
                     payload_busy_end_us - self._payload_busy_start_us
                 ) * 1_000
-                payload_wire_source = "linux-tcp-info-busy-time-v1"
+                payload_wire_source_tag = "linux-tcp-info-busy-time-v1"
         self._committed = True
         receipt = {
             "ack": True,
@@ -1188,7 +1266,7 @@ class DeferredHandoffV2Sender:
             "payload_bytes": self._total,
             "payload_sha256": self._payload_stream.hexdigest(),
             "payload_wire_ns": payload_wire_ns,
-            "payload_wire_source": payload_wire_source,
+            "payload_wire_source": payload_wire_source_tag,
             "payload_pacing_bps": self._payload_pacing_bps,
             "segments": len(self._descriptors),
         }
@@ -1344,6 +1422,10 @@ def stream_live_target(
                 },
                 payload,
             )
+        drain_wire(wire)
+        lane_time = bulk_wire_time(wire)
+        if lane_time is not None:
+            payload_wire_ns = lane_time[0]
         seal = build_seal(begin, descriptors, payload_stream.hexdigest(), total, key)
         write_frame(wire, {"kind": "seal", "manifest": seal})
         header, payload = read_frame(wire)
@@ -1368,6 +1450,7 @@ def stream_live_target(
                     "transfer_acked_unix_ns": transfer_acked_unix_ns,
                     "payload_bytes": total,
                     "payload_wire_ns": payload_wire_ns,
+                    "payload_lane": "rdma-bulk" if wire.lane is not None else "tls",
                     "segments": len(descriptors),
                 },
                 sort_keys=True,
@@ -1523,6 +1606,10 @@ def main() -> None:
             )
             if first_segment_sent_unix_ns == 0:
                 first_segment_sent_unix_ns = time.time_ns()
+        drain_wire(stream)
+        lane_time = bulk_wire_time(stream)
+        if lane_time is not None:
+            payload_wire_ns = lane_time[0]
         seal = build_seal(
             begin, descriptors, payload_stream.hexdigest(), total, key
         )
@@ -1548,6 +1635,7 @@ def main() -> None:
                     "transfer_acked_unix_ns": transfer_acked_unix_ns,
                     "payload_bytes": total,
                     "payload_wire_ns": payload_wire_ns,
+                    "payload_lane": "rdma-bulk" if stream.lane is not None else "tls",
                 },
                 sort_keys=True,
             ),

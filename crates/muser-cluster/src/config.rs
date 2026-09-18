@@ -57,6 +57,83 @@ pub struct ReceiverConfigV2 {
     /// can never silently substitute its own window.
     #[serde(default)]
     pub dflash_context_geometry: Option<DFlashContextGeometry>,
+    /// Receive segment payloads over the MelonDMA bulk lane when the producer
+    /// offers it. Absent means every payload stays inline on TLS, which is
+    /// also what happens whenever either side cannot bring the lane up.
+    #[serde(default)]
+    pub rdma: Option<RdmaReceiverConfigV1>,
+}
+
+/// The receiver's end of the RDMA bulk lane, written by `muser node add
+/// --transport rdma` from what it finds on the node.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdmaReceiverConfigV1 {
+    /// Local verbs device; MelonDMA exposes the card as `mlx5_0`.
+    pub device: String,
+    /// GID index to try first. MelonDMA hands each client its own slot, so
+    /// the default -1 means "whichever slot this process owns"; a fixed index
+    /// is only honoured if the provider answers for it.
+    #[serde(default = "default_gid_index")]
+    pub gid_index: i32,
+    /// This end's address on the RDMA link. The DriverKit extension owns the
+    /// port and there is no system ARP for it, so the provider has to be told.
+    #[serde(default)]
+    pub local_address: Option<String>,
+    /// The producer's MAC on the RDMA link, for the same reason.
+    #[serde(default)]
+    pub peer_mac: Option<String>,
+    /// Receive ring. Largest Muse segment is 6.5 MiB; 64 MiB keeps nine in
+    /// flight.
+    #[serde(default)]
+    pub ring_mib: Option<u32>,
+    /// Fail the transfer rather than fall back to inline payloads when the
+    /// lane cannot be brought up. Off by default: a fallback is announced on
+    /// stderr and in the receipt, never silent.
+    #[serde(default)]
+    pub required: bool,
+}
+
+fn default_gid_index() -> i32 {
+    -1
+}
+
+impl RdmaReceiverConfigV1 {
+    pub fn ring_bytes(&self) -> u64 {
+        u64::from(self.ring_mib.unwrap_or(64)) << 20
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.device.is_empty() {
+            return Err("rdma.device is empty".into());
+        }
+        if self.local_address.is_some() != self.peer_mac.is_some() {
+            return Err("rdma.local_address and rdma.peer_mac come as a pair".into());
+        }
+        if let Some(address) = &self.local_address {
+            address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("rdma.local_address {address:?} is not an IP address"))?;
+        }
+        if let Some(mac) = &self.peer_mac {
+            let octets: Vec<&str> = mac.split(':').collect();
+            if octets.len() != 6
+                || octets
+                    .iter()
+                    .any(|octet| octet.len() != 2 || u8::from_str_radix(octet, 16).is_err())
+            {
+                return Err(format!("rdma.peer_mac {mac:?} is not aa:bb:cc:dd:ee:ff"));
+            }
+        }
+        // The C side refuses rings outside [1 MiB, 1 GiB]; say so here, at
+        // load, rather than on the first handoff.
+        if let Some(mib) = self.ring_mib {
+            if !(8..=1024).contains(&mib) {
+                return Err(format!("rdma.ring_mib {mib} is outside 8..=1024"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_remote_max_prompt_tokens() -> usize {
@@ -164,6 +241,9 @@ impl ReceiverConfigV2 {
             && self.dflash_identity_sha256.is_some()
         {
             return Err("native producer mode cannot enroll DFlash context geometry".into());
+        }
+        if let Some(rdma) = &self.rdma {
+            rdma.validate()?;
         }
         if self.peer_leaf_sha256.is_empty() {
             return Err("cluster config must pin at least one producer TLS leaf".into());

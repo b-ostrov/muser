@@ -201,6 +201,9 @@ struct CellDiff {
 
 #[derive(Serialize)]
 struct Sample<'a> {
+    /// `rdma-bulk` when segment payloads crossed the MelonDMA bulk lane,
+    /// `tls` when they rode the mTLS stream.
+    payload_lane: &'static str,
     schema: &'static str,
     kind: &'static str,
     identity: &'a str,
@@ -273,6 +276,9 @@ struct Sample<'a> {
 
 #[derive(Serialize)]
 struct FastPerformanceSample<'a> {
+    /// `rdma-bulk` when segment payloads crossed the MelonDMA bulk lane,
+    /// `tls` when they rode the mTLS stream.
+    payload_lane: &'static str,
     schema: &'static str,
     kind: &'static str,
     identity: &'a str,
@@ -307,6 +313,9 @@ struct FastPerformanceSample<'a> {
 
 #[derive(Serialize)]
 struct OperationalProbeSample<'a> {
+    /// `rdma-bulk` when segment payloads crossed the MelonDMA bulk lane,
+    /// `tls` when they rode the mTLS stream.
+    payload_lane: &'static str,
     schema: &'static str,
     kind: &'static str,
     identity: &'a str,
@@ -1025,6 +1034,7 @@ fn run() -> Result<(), String> {
         println!(
             "{}",
             serde_json::to_string(&Sample {
+                payload_lane: if receipt.bulk_lane { "rdma-bulk" } else { "tls" },
                 schema: "muser.remote-qualify.v1",
                 kind: "sample",
                 identity: &args.identity,
@@ -1274,6 +1284,7 @@ fn run_fast_performance_only(
         println!(
             "{}",
             serde_json::to_string(&FastPerformanceSample {
+                payload_lane: if receipt.bulk_lane { "rdma-bulk" } else { "tls" },
                 schema: "muser.remote-qualify.v1",
                 kind: "fast-performance-sample",
                 identity: &args.identity,
@@ -1444,6 +1455,7 @@ fn run_operational_probe(
     println!(
         "{}",
         serde_json::to_string(&OperationalProbeSample {
+                payload_lane: if receipt.bulk_lane { "rdma-bulk" } else { "tls" },
             schema: "muser.remote-qualify.v1",
             kind: "operational-probe",
             identity: &args.identity,

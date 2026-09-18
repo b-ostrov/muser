@@ -12,9 +12,10 @@
 //! nodes are roadmap, not this release.
 //!
 //! Transport: mTLS-TCP, with a release floor of 3.0 Gbps median effective
-//! installed-payload throughput across three handoffs. RDMA/RoCE and the ATTO
-//! TB5->100 GbE Mac upgrade are roadmap fast lanes with no code here; any
-//! fabric figure for them is a vendor number, not a Muser measurement. Ships
+//! installed-payload throughput across three handoffs. With the `melon-rdma`
+//! feature and an `rdma` section in the cluster config, segment payloads can
+//! move over a MelonDMA RoCE bulk lane instead; control, seal and ACK stay on
+//! mTLS either way. The ATTO TB5->100 GbE Mac upgrade remains roadmap. Ships
 //! the 13 NoPE tiles *during* prefill (position-free -> memcpy-relocatable),
 //! and the matching SWA chunks with the last 2048 tokens of CUDA.
 //! Gate: >=95% transfer hidden `[target]`.
@@ -54,10 +55,10 @@ pub mod muse_sink;
 /// TLS 1.3/mTLS/ALPN/leaf-pin establishment and durable replay admission.
 pub mod security;
 
-/// RDMA `Read + Write` byte-pipe (MelonDMA), used as a drop-in replacement
-/// for `TcpStream` underneath the same mTLS/ALPN/leaf-pin/HMAC/replay-ledger
-/// stack above. Only compiled with `--features melon-rdma`; a stock build
-/// never touches it.
+/// Receiver half of the MelonDMA RDMA bulk lane: segment payloads land in a
+/// registered ring instead of riding the TLS stream, while every byte that
+/// decides acceptance still does. Only compiled with `--features melon-rdma`;
+/// a stock build never touches it and answers every bulk offer with a decline.
 #[cfg(feature = "melon-rdma")]
 pub mod melon_rdma;
 

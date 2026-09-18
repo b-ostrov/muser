@@ -500,6 +500,10 @@ fn run_native(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
         &key_id,
         next_epoch,
     );
+    let mut handoff = handoff;
+    if let Some(lane) = &entry.rdma {
+        handoff["rdma"] = lane.handoff_section();
+    }
     let handoff_local = local.join("handoff.json");
     write_private(&handoff_local, pretty(&handoff)?.as_bytes())?;
 
@@ -518,7 +522,7 @@ fn run_native(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
             None
         }
     };
-    let cluster = native_cluster_config_value(
+    let mut cluster = native_cluster_config_value(
         &identity,
         &ca.cert,
         &mac,
@@ -529,6 +533,9 @@ fn run_native(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
         &local.join("replay.json"),
         control.as_deref().zip(advertised.as_deref()),
     );
+    if let Some(lane) = &entry.rdma {
+        cluster["rdma"] = lane.cluster_section();
+    }
     let cluster_local = local.join("cluster.json");
     write_private(&cluster_local, pretty(&cluster)?.as_bytes())?;
 
@@ -1260,6 +1267,29 @@ mod tests {
             loaded.producer_control.unwrap().address.to_string(),
             "127.0.0.1:29591"
         );
+        assert!(loaded.rdma.is_none());
+
+        // With the lane enrolled, the same config still loads through the
+        // real receiver, carrying exactly what the provider needs.
+        let lane = super::super::rdma::RdmaLane {
+            node_device: "rocep1s0f1".into(),
+            node_gid_index: 3,
+            node_netdev: "mac-rdma-bond".into(),
+            node_address: "192.168.200.2".into(),
+            node_mac: "4c:bb:47:7d:a1:a5".into(),
+            mac_address: "192.168.200.1".into(),
+        };
+        let mut value = value;
+        value["rdma"] = lane.cluster_section();
+        write_private(&path, pretty(&value).unwrap().as_bytes()).unwrap();
+        let rdma = ReceiverConfigV2::load(&path).unwrap().rdma.expect("rdma section");
+        assert_eq!(rdma.device, "mlx5_0");
+        assert_eq!(rdma.gid_index, -1);
+        assert_eq!(rdma.local_address.as_deref(), Some("192.168.200.1"));
+        assert_eq!(rdma.peer_mac.as_deref(), Some("4c:bb:47:7d:a1:a5"));
+        let mut handoff = handoff;
+        handoff["rdma"] = lane.handoff_section();
+        assert_eq!(handoff["rdma"], json!({"device": "rocep1s0f1", "gid_index": 3}));
         let _ = std::fs::remove_dir_all(home);
     }
 

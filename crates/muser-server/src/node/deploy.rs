@@ -20,7 +20,7 @@ use super::{Ctx, Result};
 /// The lane runtime: the set `install_on_gx10.sh` shipped, plus the systemd
 /// unit template `bootstrap_node.sh daemon` instantiates from
 /// `LANE/llamacpp/muser-prefilld.service`.
-pub const RUNTIME_FILES: [&str; 8] = [
+pub const RUNTIME_FILES: [&str; 9] = [
     "muser_prefilld.py",
     "muser-prefilld",
     "muser-prefilld.service",
@@ -29,7 +29,39 @@ pub const RUNTIME_FILES: [&str; 8] = [
     "protocol.py",
     "muser_prefill_producer.sh",
     "muse-glimmer-30b.layout.json",
+    "melon_rdma_bulk.py",
 ];
+
+/// The RDMA bulk lane's C sources, staged beside the sender that loads the
+/// library built from them. They are runtime in the digest's sense — the
+/// library is only ever the one built from exactly these bytes — so they
+/// travel and are hashed like every other lane file.
+pub const RDMA_SOURCE_FILES: [&str; 2] = ["melon_rdma_bulk.c", "melon_rdma_bulk.h"];
+
+/// Builds the bulk lane's library inside the pinned image, so its glibc and
+/// libibverbs ABI is exactly the one that will load it, and swaps it in
+/// atomically. No network: the image already carries gcc and the verbs
+/// headers, and a build step has no business reaching anything else.
+const BUILD_RDMA_LIBRARY: &str = r#"set -eu
+src="$1/llamacpp"
+docker run --rm --network none --user "$(id -u):$(id -g)" --entrypoint gcc \
+    -v "$src:/src" -w /src "$2" \
+    -std=gnu11 -O2 -Wall -fPIC -shared melon_rdma_bulk.c \
+    -o libmelon_rdma_bulk.so.next -libverbs -pthread
+mv -f "$src/libmelon_rdma_bulk.so.next" "$src/libmelon_rdma_bulk.so"
+printf 'built\n'
+"#;
+
+fn push_rdma_sources(ctx: &Ctx, ssh: &super::ssh::Ssh, lane: &str) -> Result<()> {
+    for name in RDMA_SOURCE_FILES {
+        let local = ctx.repo_root.join("native/melon_rdma").join(name);
+        if !local.is_file() {
+            return Err(format!("RDMA lane source {} is missing", local.display()));
+        }
+        ssh.scp(&local, &format!("{lane}/llamacpp/{name}"))?;
+    }
+    Ok(())
+}
 
 /// The NVFP4 vLLM producer runtime, staged into `lane_dir/vllm` only for
 /// `--producer native`: the resident-producer pair and the container recipe.
@@ -296,6 +328,10 @@ pub fn run(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
                 &format!("push the {VLLM_PACKAGE} package into {lane}/vllm"),
             );
         }
+        ctx.progress.plan(
+            Step::Deploy,
+            &format!("push the RDMA bulk lane sources into {lane}/llamacpp"),
+        );
         ctx.progress.plan_command(
             Step::Deploy,
             &format!("push {} into {lane}", super::model::BOOTSTRAP),
@@ -340,6 +376,7 @@ pub fn run(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
         }
         ssh.scp(&local, &format!("{lane}/llamacpp/{name}"))?;
     }
+    push_rdma_sources(ctx, &ssh, &lane)?;
     // The bootstrap script is what the model and daemon steps drive, so it
     // lands here rather than only alongside its first caller.
     ssh.scp(
@@ -476,6 +513,16 @@ fn run_native(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
                 ),
             );
         }
+        ctx.progress.plan(
+            Step::Deploy,
+            &format!("push the RDMA bulk lane sources into {lane}/llamacpp"),
+        );
+        if entry.rdma.is_some() {
+            ctx.progress.plan(
+                Step::Deploy,
+                "build the RDMA bulk library inside the pinned image",
+            );
+        }
         ctx.progress
             .plan(Step::Deploy, "finish without deploying anything");
         return Ok(());
@@ -542,10 +589,22 @@ fn run_native(ctx: &Ctx, entry: &mut NodeEntry) -> Result<()> {
             .ok_or_else(|| format!("vLLM package module {} has no name", local.display()))?;
         ssh.scp(&local, &format!("{lane}/vllm/{VLLM_PACKAGE}/{name}"))?;
     }
+    push_rdma_sources(ctx, &ssh, &lane)?;
     ssh.scp(
         &bootstrap(ctx),
         &format!("{lane}/{}", super::model::BOOTSTRAP),
     )?;
+    if entry.rdma.is_some() {
+        let built = ssh.run(BUILD_RDMA_LIBRARY, &[&lane, &identity.image_id])?;
+        if built.trim() != "built" {
+            return Err("the RDMA bulk library did not build inside the pinned image".into());
+        }
+        ctx.progress.emit(
+            Step::Deploy,
+            Status::Info,
+            "RDMA bulk library built inside the pinned image",
+        );
+    }
 
     let durable_receipt = persist_admitted_receipt(ctx, entry, identity.admitted_bytes())?;
     entry.container_image = Some(identity.image_id.clone());
@@ -633,6 +692,12 @@ pub(super) fn runtime_sha256(repo_root: &Path, producer: ProducerKind) -> Result
             )
         })
         .collect();
+    files.extend(RDMA_SOURCE_FILES.iter().map(|name| {
+        (
+            format!("llamacpp/{name}"),
+            repo_root.join("native/melon_rdma").join(name),
+        )
+    }));
     files.push((
         super::model::BOOTSTRAP.to_string(),
         bootstrap_path(repo_root),
@@ -900,6 +965,7 @@ mod tests {
             model_source_base: None,
             prompt_fixture: None,
             lane_dir_override: None,
+            rdma_request: Default::default(),
             verified_native_consumer: std::sync::Mutex::new(None),
         };
         let entry = NodeEntry::draft("gx10", "muser", "gx10.local", &home, None);
@@ -938,6 +1004,7 @@ mod tests {
             model_source_base: None,
             prompt_fixture: None,
             lane_dir_override: None,
+            rdma_request: Default::default(),
             verified_native_consumer: std::sync::Mutex::new(None),
         };
         let mut entry = NodeEntry::draft("gx10", "muser", "gx10.local", &home, None);

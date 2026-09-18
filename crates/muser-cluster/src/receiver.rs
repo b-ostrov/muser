@@ -8,7 +8,7 @@
 //! and the configuration names a single control endpoint and HMAC key id.
 //! Connections that arrive for any other request are closed, never installed.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,81 +30,19 @@ use crate::identity::{
 };
 use crate::muse_sink::MuseCacheShadow;
 use crate::producer::{
-    read_begin_v2, receive_begun_v2_with_replay_ack_phased, ReceiverError, ReceiverPolicy,
+    receive_begun_v2_with_replay_ack_phased, BulkPayloadSource, ReceiverError, ReceiverPolicy,
 };
 use crate::security::{
     accept_mtls, connect_mtls_with_alpn, load_mac_key, ClientTlsStream, ReplayLedger,
     ServerTlsStream, TlsFiles,
 };
-use crate::transport::{BeginAdmissionV2, FrameLimitsV2};
+use crate::transport::{
+    read_frame_v2, write_frame_v2, BeginAdmissionV2, FrameLimitsV2, WireFrameV2,
+};
 
-/// Either transport's server-side TLS stream. The `receive_v2`/`producer.rs`
-/// family below the accept path is already generic over `impl Read + Write`
-/// — this is the minimum needed so the accept path itself (which does own
-/// the concrete TLS/transport setup) can select TCP or RDMA per receiver
-/// process without duplicating any of that logic.
-enum AnyServerTlsStream {
-    Tcp(ServerTlsStream),
-    #[cfg(feature = "melon-rdma")]
-    Rdma(crate::security::rdma::ServerTlsStreamRdma),
-}
-
-impl Read for AnyServerTlsStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            AnyServerTlsStream::Tcp(s) => s.read(buf),
-            #[cfg(feature = "melon-rdma")]
-            AnyServerTlsStream::Rdma(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for AnyServerTlsStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            AnyServerTlsStream::Tcp(s) => s.write(buf),
-            #[cfg(feature = "melon-rdma")]
-            AnyServerTlsStream::Rdma(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            AnyServerTlsStream::Tcp(s) => s.flush(),
-            #[cfg(feature = "melon-rdma")]
-            AnyServerTlsStream::Rdma(s) => s.flush(),
-        }
-    }
-}
-
-/// `MUSER_TRANSPORT=rdma` selects the RDMA accept path for every incoming
-/// connection on this receiver process; unset (or any other value) is the
-/// unchanged TCP default. A per-process switch, not a per-connection
-/// negotiation — matching how `GGML_RPC_REQUIRE_RDMA` gates MelonDMA's
-/// llama.cpp transport. First pass: an env var, not a `ReceiverConfigV2`
-/// field, to avoid touching that struct's `deny_unknown_fields` schema and
-/// `muser node add`'s config generator while this path is still being
-/// proven — fold it into the generated config once proven on hardware.
-fn rdma_transport_enabled() -> bool {
-    std::env::var("MUSER_TRANSPORT")
-        .map(|value| value == "rdma")
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "melon-rdma")]
-fn rdma_dev() -> String {
-    std::env::var("MUSER_RDMA_DEV").unwrap_or_else(|_| "mlx5_0".to_string())
-}
-
-#[cfg(feature = "melon-rdma")]
-fn rdma_gid_index() -> i32 {
-    // Re-verify with `ibv_devinfo -v` before trusting a previously-known
-    // value — this exact GID table has drifted once already on the paired
-    // Linux box (a bonded interface moved the expected RoCEv1 entry).
-    std::env::var("MUSER_RDMA_GID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
-}
+/// A negotiated bulk lane for one transfer. Boxed so a build without the
+/// `melon-rdma` feature has the same shape and simply never holds one.
+type BulkLane = Box<dyn BulkPayloadSource + Send>;
 
 /// Producer telemetry is read after the generation is already live, so it is
 /// held to a deadline that decode can afford to lose.
@@ -188,6 +126,8 @@ pub struct RemoteReceiveReceipt {
     pub components: crate::muse_sink::ComponentInstallEvidence,
     /// N-series phase split: socket drain, verify, sink install, seal, commit.
     pub phases: crate::phase::HandoffPhaseNanos,
+    /// Payload bytes moved over the RDMA bulk lane rather than inline on TLS.
+    pub bulk_lane: bool,
 }
 
 /// The commit path durably reserves every generation with
@@ -365,8 +305,9 @@ impl RemoteReceiver {
         // request id; an unsolicited producer has never seen one.
         let expected_prefix = control.is_some().then(|| request_id.clone());
         let accept_started = Instant::now();
-        let (mut stream, admission) =
+        let (mut stream, admission, mut lane) =
             self.accept_matching_begin(expected_prefix.as_deref(), wait)?;
+        let bulk_lane = lane.is_some();
         let accept_ns = nanos(accept_started.elapsed());
         let transfer_started = Instant::now();
         let expectations = BeginExpectationsV2 {
@@ -385,6 +326,9 @@ impl RemoteReceiver {
             expected_key_id: &self.config.hmac_key_id,
             minimum_key_epoch: self.config.minimum_hmac_epoch,
             limits: Default::default(),
+            bulk: lane
+                .as_deref_mut()
+                .map(|lane| lane as &mut dyn BulkPayloadSource),
         };
         let mut replay = self.replay.lock().map_err(|_| {
             RemoteReceiveError::new(
@@ -507,6 +451,7 @@ impl RemoteReceiver {
             total_ns: nanos(total_started.elapsed()),
             producer,
             components,
+            bulk_lane,
         })
     }
 
@@ -590,21 +535,21 @@ impl RemoteReceiver {
         &self,
         expected_prefix: Option<&str>,
         wait: Duration,
-    ) -> Result<(AnyServerTlsStream, BeginAdmissionV2), RemoteReceiveError> {
+    ) -> Result<(ServerTlsStream, BeginAdmissionV2, Option<BulkLane>), RemoteReceiveError> {
         let deadline = Instant::now() + wait;
         let mut dropped = 0usize;
         let mut last_drop = String::new();
         loop {
             let tcp = self.accept_until(deadline, dropped, &last_drop)?;
             match self.begin_from(tcp, deadline) {
-                Ok((stream, admission))
+                Ok((stream, admission, lane))
                     if expected_prefix.is_none_or(|prefix| {
                         transfer_id_matches(prefix, &admission.manifest.transfer_id)
                     }) =>
                 {
-                    return Ok((stream, admission))
+                    return Ok((stream, admission, lane))
                 }
-                Ok((_, admission)) => {
+                Ok((_, admission, _)) => {
                     dropped += 1;
                     last_drop = format!(
                         "transfer {} belongs to another request",
@@ -623,38 +568,15 @@ impl RemoteReceiver {
         &self,
         tcp: TcpStream,
         deadline: Instant,
-    ) -> Result<(AnyServerTlsStream, BeginAdmissionV2), String> {
+    ) -> Result<(ServerTlsStream, BeginAdmissionV2, Option<BulkLane>), String> {
         let files = TlsFiles {
             certificate_chain: &self.config.certificate_chain,
             private_key: &self.config.private_key,
             peer_ca: &self.config.peer_ca,
             leaf_sha256_pins: &self.config.peer_leaf_sha256,
         };
-        let mut stream = if rdma_transport_enabled() {
-            #[cfg(feature = "melon-rdma")]
-            {
-                let rdma = crate::security::rdma::accept_mtls_over_rdma(
-                    tcp,
-                    files,
-                    crate::security::MUSER_HANDOFF_ALPN,
-                    &rdma_dev(),
-                    rdma_gid_index(),
-                )
-                .map_err(|error| error.to_string())?;
-                AnyServerTlsStream::Rdma(rdma)
-            }
-            #[cfg(not(feature = "melon-rdma"))]
-            {
-                return Err(
-                    "MUSER_TRANSPORT=rdma requested but this build lacks the melon-rdma feature"
-                        .to_string(),
-                );
-            }
-        } else {
-            let tcp_tls = accept_mtls(tcp, files, self.config.timeout())
-                .map_err(|error| error.to_string())?;
-            AnyServerTlsStream::Tcp(tcp_tls)
-        };
+        let mut stream = accept_mtls(tcp, files, self.config.timeout())
+            .map_err(|error| error.to_string())?;
         // A producer that handshakes and then says nothing must not hold the
         // whole socket timeout: admission is bounded by the accept deadline
         // this request is already waiting on.
@@ -663,8 +585,6 @@ impl RemoteReceiver {
             .max(PRODUCER_RECEIPT_DEADLINE)
             .min(self.config.timeout());
         set_read_timeout(&stream, admission)?;
-        let admission = read_begin_v2(&mut stream, FrameLimitsV2::default())
-            .map_err(|error| error.to_string())?;
         // The producer connects and sends its begin within milliseconds, then
         // computes prefill before the first segment appears — for deep prompts
         // that compute was measured in minutes. The transfer reads must carry
@@ -674,8 +594,74 @@ impl RemoteReceiver {
         let transfer_read = deadline
             .saturating_duration_since(Instant::now())
             .max(self.config.timeout());
+        let limits = FrameLimitsV2::default();
+        let mut lane = None;
+        let mut frame = read_frame_v2(&mut stream, limits).map_err(|error| error.to_string())?;
+        if let WireFrameV2::BulkOffer { endpoint } = frame {
+            lane = self.negotiate_bulk(&mut stream, &endpoint, transfer_read)?;
+            frame = read_frame_v2(&mut stream, limits).map_err(|error| error.to_string())?;
+        }
+        let WireFrameV2::Begin(admission) = frame else {
+            return Err("expected begin frame".to_string());
+        };
         set_read_timeout(&stream, transfer_read)?;
-        Ok((stream, admission))
+        Ok((stream, admission, lane))
+    }
+
+    /// Answers a producer's bulk offer. Declining is never an error for the
+    /// transfer — the producer keeps its payloads inline — unless the
+    /// configuration says the lane is required. Every decline is printed,
+    /// because an RDMA link that quietly carries nothing is the failure this
+    /// project has already paid for more than once.
+    fn negotiate_bulk(
+        &self,
+        stream: &mut ServerTlsStream,
+        offer: &[u8],
+        timeout: Duration,
+    ) -> Result<Option<BulkLane>, String> {
+        let outcome = self.open_bulk(offer, timeout);
+        let (frame, lane) = match outcome {
+            Ok((endpoint, lane)) => (WireFrameV2::BulkAccept { endpoint }, Some(lane)),
+            Err(reason) => {
+                eprintln!("muser: RDMA bulk lane declined, payloads stay on TLS: {reason}");
+                if self.config.rdma.as_ref().is_some_and(|rdma| rdma.required) {
+                    let _ = write_frame_v2(
+                        &mut *stream,
+                        &WireFrameV2::BulkDecline {
+                            reason: reason.clone(),
+                        },
+                        FrameLimitsV2::default(),
+                    );
+                    return Err(format!("RDMA bulk lane is required and failed: {reason}"));
+                }
+                (WireFrameV2::BulkDecline { reason }, None)
+            }
+        };
+        write_frame_v2(&mut *stream, &frame, FrameLimitsV2::default())
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())?;
+        Ok(lane)
+    }
+
+    #[cfg(feature = "melon-rdma")]
+    fn open_bulk(&self, offer: &[u8], timeout: Duration) -> Result<(Vec<u8>, BulkLane), String> {
+        let config = self
+            .config
+            .rdma
+            .as_ref()
+            .ok_or_else(|| "this receiver has no rdma section in its cluster config".to_string())?;
+        let mut receiver = crate::melon_rdma::BulkReceiver::create(config)?;
+        // Connect before answering: the producer starts writing the moment it
+        // reads the accept, so our queue pair must already be ready to receive.
+        receiver.connect(offer)?;
+        receiver.set_timeout(timeout);
+        let endpoint = receiver.endpoint().to_vec();
+        Ok((endpoint, Box::new(receiver)))
+    }
+
+    #[cfg(not(feature = "melon-rdma"))]
+    fn open_bulk(&self, _offer: &[u8], _timeout: Duration) -> Result<(Vec<u8>, BulkLane), String> {
+        Err("this muser was built without the melon-rdma feature".to_string())
     }
 
     fn accept_until(
@@ -720,20 +706,11 @@ impl RemoteReceiver {
     }
 }
 
-fn set_read_timeout(stream: &AnyServerTlsStream, timeout: Duration) -> Result<(), String> {
-    match stream {
-        AnyServerTlsStream::Tcp(s) => s
-            .sock
-            .set_read_timeout(Some(timeout))
-            .map_err(|error| error.to_string()),
-        // The RDMA byte-pipe's recv() has no socket-level read-timeout
-        // equivalent yet — a known limitation of this first pass, not an
-        // oversight. A stalled peer still surfaces (an RC QP's bounded
-        // retry count eventually produces an error completion rather than
-        // hanging the process forever), just not on this specific deadline.
-        #[cfg(feature = "melon-rdma")]
-        AnyServerTlsStream::Rdma(_) => Ok(()),
-    }
+fn set_read_timeout(stream: &ServerTlsStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .sock
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())
 }
 
 static REMOTE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);

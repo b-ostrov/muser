@@ -949,6 +949,7 @@ mod tests {
             total_ns: 1_000_000_002,
             producer: None,
             components: Default::default(),
+            bulk_lane: false,
             phases: muser_cluster::phase::HandoffPhaseNanos {
                 segment_read_ns: 250_000_000,
                 ..Default::default()

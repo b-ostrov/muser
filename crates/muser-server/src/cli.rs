@@ -207,6 +207,23 @@ pub struct NodeAddArgs {
     #[arg(long)]
     pub repair: bool,
 
+    /// Where handoff payloads travel. `rdma` finds the node's RoCE v2 address
+    /// on the cable to this Mac and enrolls the MelonDMA bulk lane (native
+    /// lane, `melon-rdma` build); `tcp` removes it. Unset keeps the node's
+    /// current choice. Control, seal and ACK stay on mTLS either way.
+    #[arg(long, value_enum, value_name = "TRANSPORT")]
+    pub transport: Option<crate::node::registry::TransportKind>,
+
+    /// The node's address on the RDMA link, when it has more than one
+    /// point-to-point RoCE v2 address or the link is not point-to-point.
+    #[arg(long, value_name = "IPV4")]
+    pub rdma_node_address: Option<String>,
+
+    /// This Mac's address on the RDMA link, when it cannot be derived as the
+    /// other host of the node's /30 or /31.
+    #[arg(long, value_name = "IPV4")]
+    pub rdma_mac_address: Option<String>,
+
     #[command(flatten)]
     pub common: NodeCommonArgs,
 }

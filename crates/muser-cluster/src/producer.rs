@@ -13,8 +13,8 @@ use kvpack_handoff::{
 
 use crate::security::{ReplayLedger, SecurityError};
 use crate::transport::{
-    read_frame_v2, read_frame_v2_timed, write_frame_v2, BeginAdmissionV2, FrameLimitsV2,
-    TransportError, WireFrameV2,
+    read_frame_v2, read_frame_v2_timed, write_frame_v2, BeginAdmissionV2, BulkRefV2,
+    FrameLimitsV2, TransportError, WireFrameV2,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +36,16 @@ pub struct ReceiverPolicy<'a> {
     pub expected_key_id: &'a str,
     pub minimum_key_epoch: u64,
     pub limits: FrameLimitsV2,
+    /// The negotiated bulk lane, if any. A `bulk` segment on a transfer that
+    /// negotiated none is a protocol violation, not a fallback.
+    pub bulk: Option<&'a mut dyn BulkPayloadSource>,
+}
+
+/// Where a `bulk` segment's payload comes from. The MelonDMA receiver is the
+/// real one; it hands back an owned copy, so the bytes verified are the bytes
+/// installed.
+pub trait BulkPayloadSource {
+    fn take(&mut self, bulk: &BulkRefV2) -> Result<Vec<u8>, String>;
 }
 
 /// Loopback/live stream core. TLS/mTLS and leaf-pin establishment happens
@@ -127,10 +137,48 @@ fn receive_after_begin_with_reservation_phased(
     )?;
     let mut receiver = AtomicReceiverV2::begin(begin, key, sink)?;
     let mut reserve = Some(reserve);
+    let mut bulk = policy.bulk;
     let frame_loop_started = std::time::Instant::now();
     loop {
         let frame_offset_ns = nanos(frame_loop_started.elapsed());
-        let (frame, read_ns) = read_frame_v2_timed(&mut *reader, policy.limits)?;
+        let (frame, mut read_ns) = read_frame_v2_timed(&mut *reader, policy.limits)?;
+        // A bulk segment becomes the ordinary segment it describes, with its
+        // payload taken off the lane, before anything looks at it: from here
+        // on verify and install cannot tell the two transports apart. The
+        // lane wait counts as read time, the same as draining a socket.
+        let frame = match frame {
+            WireFrameV2::BulkSegment {
+                sequence,
+                descriptor,
+                bulk: reference,
+            } => {
+                let Some(source) = bulk.as_deref_mut() else {
+                    receiver.abort();
+                    return Err(ReceiverError::Transport(TransportError::Invalid(
+                        "bulk segment on a transfer that negotiated no bulk lane".into(),
+                    )));
+                };
+                let lane_started = std::time::Instant::now();
+                let payload = match source.take(&reference) {
+                    Ok(payload) => payload,
+                    Err(message) => {
+                        receiver.abort();
+                        return Err(ReceiverError::Transport(TransportError::Io(
+                            std::io::Error::other(message),
+                        )));
+                    }
+                };
+                read_ns = read_ns.saturating_add(nanos(lane_started.elapsed()));
+                match descriptor {
+                    Some(descriptor) => WireFrameV2::DeferredSegment {
+                        descriptor,
+                        payload,
+                    },
+                    None => WireFrameV2::Segment { sequence, payload },
+                }
+            }
+            other => other,
+        };
         match frame {
             WireFrameV2::Segment { sequence, payload } => {
                 let process_started = std::time::Instant::now();
@@ -213,6 +261,17 @@ fn receive_after_begin_with_reservation_phased(
                     ),
                 ));
             }
+            WireFrameV2::BulkOffer { .. }
+            | WireFrameV2::BulkAccept { .. }
+            | WireFrameV2::BulkDecline { .. } => {
+                receiver.abort();
+                return Err(ReceiverError::Handoff(
+                    kvpack_handoff::HandoffError::Validation(
+                        "bulk lane negotiation belongs before Begin".into(),
+                    ),
+                ));
+            }
+            WireFrameV2::BulkSegment { .. } => unreachable!("resolved above"),
         }
     }
 }
@@ -405,6 +464,163 @@ mod tests {
         let validated = ValidatedBeginV2::validate(manifest.clone(), 20, "loop-key", 4).unwrap();
         (manifest, validated, MacKey::from_bytes([7; 32]), payloads)
     }
+    /// Serves bulk payloads from memory in put order, and can be told to
+    /// hand back bytes other than the ones the producer sealed.
+    struct MemoryLane {
+        payloads: Vec<Vec<u8>>,
+        taken: u32,
+        tamper: bool,
+    }
+    impl BulkPayloadSource for MemoryLane {
+        fn take(&mut self, bulk: &BulkRefV2) -> Result<Vec<u8>, String> {
+            if bulk.index != self.taken {
+                return Err(format!("put {} out of order", bulk.index));
+            }
+            let mut payload = self.payloads[bulk.index as usize].clone();
+            if payload.len() as u64 != bulk.length {
+                return Err("length mismatch".into());
+            }
+            if self.tamper {
+                payload[0] ^= 0xff;
+            }
+            self.taken += 1;
+            Ok(payload)
+        }
+    }
+
+    fn bulk_wire(seal: SealManifestV2, payloads: &[Vec<u8>]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let limits = FrameLimitsV2::default();
+        let mut position = 0u64;
+        for (index, payload) in payloads.iter().enumerate() {
+            write_frame_v2(
+                &mut wire,
+                &WireFrameV2::BulkSegment {
+                    sequence: index as u32,
+                    descriptor: None,
+                    bulk: BulkRefV2 {
+                        index: index as u32,
+                        position,
+                        length: payload.len() as u64,
+                    },
+                },
+                limits,
+            )
+            .unwrap();
+            position += payload.len() as u64;
+        }
+        write_frame_v2(&mut wire, &WireFrameV2::Seal(seal), limits).unwrap();
+        wire
+    }
+
+    fn policy_with<'a>(bulk: Option<&'a mut dyn BulkPayloadSource>) -> ReceiverPolicy<'a> {
+        ReceiverPolicy {
+            now_unix_ms: 20,
+            expected_key_id: "loop-key",
+            minimum_key_epoch: 4,
+            limits: FrameLimitsV2::default(),
+            bulk,
+        }
+    }
+
+    fn fresh_sink() -> Sink {
+        Sink {
+            live: Arc::new(AtomicU64::new(0)),
+            aborted: Arc::new(AtomicBool::new(false)),
+            generation: 9,
+            segments: 0,
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    fn bulk_payloads_commit_exactly_like_inline_ones() {
+        let (manifest, validated, key, payloads) = material();
+        let seal = SealManifestV2::sign(&validated, &manifest.segments, &payloads, &key).unwrap();
+        let wire = bulk_wire(seal, &payloads);
+        let mut lane = MemoryLane {
+            payloads: payloads.clone(),
+            taken: 0,
+            tamper: false,
+        };
+        let receipt = receive_after_begin(
+            &mut wire.as_slice(),
+            key,
+            policy_with(Some(&mut lane)),
+            fresh_sink(),
+            manifest,
+        )
+        .unwrap();
+        assert_eq!(receipt.generation, 9);
+        assert_eq!(receipt.installed_segments, 1);
+        assert_eq!(receipt.installed_bytes, 4);
+        assert_eq!(lane.taken, 1);
+    }
+
+    #[test]
+    fn a_bulk_payload_that_changed_in_the_ring_fails_verification() {
+        // The lane is outside TLS: what makes it safe is that the sha256 in
+        // the descriptor still binds the bytes. A peer that rewrites the ring
+        // must get a verification failure, never an install.
+        let (manifest, validated, key, payloads) = material();
+        let seal = SealManifestV2::sign(&validated, &manifest.segments, &payloads, &key).unwrap();
+        let wire = bulk_wire(seal, &payloads);
+        let mut lane = MemoryLane {
+            payloads,
+            taken: 0,
+            tamper: true,
+        };
+        let sink = fresh_sink();
+        let live = Arc::clone(&sink.live);
+        let error = receive_after_begin(
+            &mut wire.as_slice(),
+            key,
+            policy_with(Some(&mut lane)),
+            sink,
+            manifest,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ReceiverError::Handoff(_)), "{error}");
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_bulk_segment_without_a_negotiated_lane_is_refused() {
+        let (manifest, validated, key, payloads) = material();
+        let seal = SealManifestV2::sign(&validated, &manifest.segments, &payloads, &key).unwrap();
+        let wire = bulk_wire(seal, &payloads);
+        let sink = fresh_sink();
+        let aborted = Arc::clone(&sink.aborted);
+        let error =
+            receive_after_begin(&mut wire.as_slice(), key, policy_with(None), sink, manifest)
+                .unwrap_err();
+        assert!(error.to_string().contains("negotiated no bulk lane"), "{error}");
+        assert!(aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn bulk_negotiation_after_begin_is_refused() {
+        let (manifest, _validated, key, _payloads) = material();
+        let mut wire = Vec::new();
+        write_frame_v2(
+            &mut wire,
+            &WireFrameV2::BulkOffer {
+                endpoint: vec![0; 64],
+            },
+            FrameLimitsV2::default(),
+        )
+        .unwrap();
+        let error = receive_after_begin(
+            &mut wire.as_slice(),
+            key,
+            policy_with(None),
+            fresh_sink(),
+            manifest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("before Begin"), "{error}");
+    }
+
     #[test]
     fn phased_loopback_records_segment_and_commit_phases() {
         let (manifest, validated, key, payloads) = material();
@@ -431,6 +647,7 @@ mod tests {
                 expected_key_id: "loop-key",
                 minimum_key_epoch: 4,
                 limits,
+                bulk: None,
             },
             Sink {
                 live: Arc::new(AtomicU64::new(0)),
@@ -500,6 +717,7 @@ mod tests {
                 expected_key_id: "loop-key",
                 minimum_key_epoch: 4,
                 limits,
+                bulk: None,
             },
             sink,
         )
@@ -530,7 +748,8 @@ mod tests {
                 now_unix_ms: 20,
                 expected_key_id: "loop-key",
                 minimum_key_epoch: 4,
-                limits
+                limits,
+                bulk: None,
             },
             sink
         )
@@ -594,6 +813,7 @@ mod tests {
                 expected_key_id: "loop-key",
                 minimum_key_epoch: 4,
                 limits,
+                bulk: None,
             },
             &mut replay,
             Sink {
@@ -642,6 +862,7 @@ mod tests {
                 expected_key_id: "loop-key",
                 minimum_key_epoch: 4,
                 limits,
+                bulk: None,
             },
             Sink {
                 live: Arc::clone(&live),

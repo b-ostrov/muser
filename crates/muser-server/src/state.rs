@@ -2169,6 +2169,7 @@ mod tests {
             total_ns: 1,
             producer: None,
             components: Default::default(),
+            bulk_lane: false,
             phases: Default::default(),
         });
         assert!(s.remote_route_is_open());
@@ -2201,6 +2202,7 @@ mod tests {
             total_ns: 1,
             producer: None,
             components: Default::default(),
+            bulk_lane: false,
             phases: Default::default(),
         });
         for _ in 0..(REMOTE_BREAKER_FAILURES - 1) {
@@ -2236,6 +2238,7 @@ mod tests {
             total_ns: 1,
             producer: None,
             components: Default::default(),
+            bulk_lane: false,
             phases: Default::default(),
         });
         assert!(s.remote_route_is_open());

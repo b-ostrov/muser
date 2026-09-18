@@ -1,4 +1,4 @@
-// Compiles native/melon_rdma/melon_rdma_pipe.c into muser-cluster only when
+// Compiles native/melon_rdma/melon_rdma_bulk.c into muser-cluster only when
 // the `melon-rdma` feature is enabled. A stock `cargo build` (no feature)
 // never touches this — no MelonDMA checkout or RDMA NIC required.
 //
@@ -12,9 +12,9 @@ fn main() {
         return;
     }
 
-    let src = "../../native/melon_rdma/melon_rdma_pipe.c";
+    let src = "../../native/melon_rdma/melon_rdma_bulk.c";
     println!("cargo:rerun-if-changed={src}");
-    println!("cargo:rerun-if-changed=../../native/melon_rdma/melon_rdma_pipe.h");
+    println!("cargo:rerun-if-changed=../../native/melon_rdma/melon_rdma_bulk.h");
     println!("cargo:rerun-if-env-changed=MELONDMA_DEXT_DIR");
 
     let mut build = cc::Build::new();
@@ -38,5 +38,5 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=dylib=ibverbs");
 
-    build.compile("melon_rdma_pipe");
+    build.compile("melon_rdma_bulk");
 }

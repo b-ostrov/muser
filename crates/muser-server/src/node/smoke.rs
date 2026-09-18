@@ -1064,6 +1064,7 @@ mod tests {
             model_source_base: None,
             prompt_fixture: None,
             lane_dir_override: None,
+            rdma_request: Default::default(),
             verified_native_consumer: std::sync::Mutex::new(None),
         }
     }

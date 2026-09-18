@@ -28,6 +28,15 @@ pub const STATE_BLOCKED: &str = "blocked";
 /// individually rerun step cannot drift onto the other lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    /// Segment payloads inline on the mTLS stream.
+    Tcp,
+    /// Segment payloads over the MelonDMA RoCE bulk lane.
+    Rdma,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum ProducerKind {
     /// The llama.cpp sealed-exporter lane: combined target+DFlash transfers.
     Llamacpp,
@@ -210,6 +219,9 @@ pub struct NodeEntry {
     pub connect_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The enrolled RDMA bulk lane; absent means payloads ride TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma: Option<super::rdma::RdmaLane>,
     pub updated: String,
 }
 
@@ -242,6 +254,7 @@ impl NodeEntry {
             netqual_rtt_ms: None,
             connect_host: None,
             last_error: None,
+            rdma: None,
             updated: now_rfc3339(),
         }
     }

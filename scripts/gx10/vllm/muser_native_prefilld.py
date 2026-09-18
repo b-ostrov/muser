@@ -63,18 +63,20 @@ CONTAINER_OVERLAY_MOUNTS = (
         "/opt/muser/scripts/gx10/llamacpp/llamacpp_session_send.py",
     ),
     (LLAMACPP_DIR / "protocol.py", "/opt/muser/scripts/gx10/llamacpp/protocol.py"),
-    # MelonDMA RDMA transport (off by default; MUSER_TRANSPORT=rdma below
-    # opts in). melon_rdma_stream.py is muser_v2_send.py's optional RDMA
-    # byte-pipe; the .so must be compiled inside the exact pinned image (see
-    # `docker run --rm --entrypoint gcc ...` against melon_rdma_pipe.c on the
-    # GX10 node) so its glibc/libibverbs ABI always matches what runs it.
+)
+# The RDMA bulk lane's sender and its library, mounted only when the lane is
+# configured. The library is built by `muser node deploy` inside this exact
+# pinned image, so its glibc/libibverbs ABI is the one that loads it; it is a
+# build product and so sits outside the runtime digest, while the sources it
+# is built from sit inside it.
+RDMA_OVERLAY_MOUNTS = (
     (
-        LLAMACPP_DIR / "melon_rdma_stream.py",
-        "/opt/muser/scripts/gx10/llamacpp/melon_rdma_stream.py",
+        LLAMACPP_DIR / "melon_rdma_bulk.py",
+        "/opt/muser/scripts/gx10/llamacpp/melon_rdma_bulk.py",
     ),
     (
-        LLAMACPP_DIR / "libmelon_rdma_pipe.so",
-        "/opt/muser/scripts/gx10/llamacpp/libmelon_rdma_pipe.so",
+        LLAMACPP_DIR / "libmelon_rdma_bulk.so",
+        "/opt/muser/scripts/gx10/llamacpp/libmelon_rdma_bulk.so",
     ),
 )
 DEPLOYED_LLAMACPP_FILES = (
@@ -86,6 +88,9 @@ DEPLOYED_LLAMACPP_FILES = (
     "protocol.py",
     "muser_prefill_producer.sh",
     "muse-glimmer-30b.layout.json",
+    "melon_rdma_bulk.py",
+    "melon_rdma_bulk.c",
+    "melon_rdma_bulk.h",
 )
 DEPLOYED_VLLM_FILES = (
     "muser_native_prefilld.py",
@@ -145,7 +150,37 @@ def regular_file(path: Path, label: str) -> None:
         raise NativePrefilldError(f"{label} is not a regular file: {path}")
 
 
-def runtime_overlay_mounts() -> list[tuple[Path, str]]:
+def rdma_settings(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Where this producer sends payloads.
+
+    Enrollment decides (`muser node add --transport rdma` writes the handoff
+    config's `rdma` section from what it found in sysfs); the operator env file
+    can still force either way with MUSER_TRANSPORT, and override the device or
+    GID index. Returns None for inline TLS payloads."""
+    forced = os.environ.get("MUSER_TRANSPORT")
+    if forced not in (None, "", "tcp", "rdma"):
+        raise NativePrefilldError(f"MUSER_TRANSPORT={forced!r} is neither tcp nor rdma")
+    enrolled = config.get("rdma")
+    if forced == "tcp" or (not enrolled and forced != "rdma"):
+        return None
+    enrolled = enrolled or {}
+    device = os.environ.get("MUSER_RDMA_DEV") or enrolled.get("device")
+    gid = os.environ.get("MUSER_RDMA_GID") or enrolled.get("gid_index")
+    if not device or gid is None:
+        raise NativePrefilldError(
+            "the RDMA bulk lane needs a device and a RoCE v2 GID index; "
+            "re-run `muser node add <user@host> --transport rdma`"
+        )
+    try:
+        gid_index = int(gid)
+    except (TypeError, ValueError) as error:
+        raise NativePrefilldError(f"RDMA GID index {gid!r} is not an integer") from error
+    if gid_index < 0:
+        raise NativePrefilldError("the RDMA GID index must be explicit on Linux")
+    return {"device": str(device), "gid_index": gid_index}
+
+
+def runtime_overlay_mounts(extra: tuple = ()) -> list[tuple[Path, str]]:
     """Resolve one immutable set of host runtime paths for Docker.
 
     A package directory is mounted as a directory because Python imports a
@@ -155,7 +190,7 @@ def runtime_overlay_mounts() -> list[tuple[Path, str]]:
     """
 
     resolved: list[tuple[Path, str]] = []
-    for source, target in CONTAINER_OVERLAY_MOUNTS:
+    for source, target in CONTAINER_OVERLAY_MOUNTS + tuple(extra):
         try:
             mode = source.lstat().st_mode
         except OSError as error:
@@ -299,8 +334,18 @@ def load_config(path: Path) -> dict[str, Any]:
         "rope_cache_bytes",
         "rope_cache_sha256",
     }
-    if not isinstance(config, dict) or set(config) != expected:
+    if not isinstance(config, dict) or set(config) - {"rdma"} != expected:
         raise NativePrefilldError("native handoff config field set differs")
+    rdma = config.get("rdma")
+    if rdma is not None and (
+        not isinstance(rdma, dict)
+        or set(rdma) != {"device", "gid_index"}
+        or not isinstance(rdma["device"], str)
+        or not rdma["device"]
+        or not isinstance(rdma["gid_index"], int)
+        or rdma["gid_index"] < 0
+    ):
+        raise NativePrefilldError("native handoff config rdma section is malformed")
     root = path.parent
     for field in (
         "certificate_chain",
@@ -550,6 +595,7 @@ def start_container(config: dict[str, Any]) -> Path:
     # epoch. Resolve it once so Docker binds one immutable credential set for
     # the container's lifetime rather than following a later enrollment.
     pki_dir = config["certificate_chain"].resolve(strict=True).parent
+    rdma = rdma_settings(config)
     command = [
         "run",
         "-d",
@@ -567,21 +613,17 @@ def start_container(config: dict[str, Any]) -> Path:
         f"{os.getuid()}:{os.getgid()}",
         "-e",
         "MUSER_NVFP4_EXACT=0",
-        # MelonDMA RDMA transport: off by default (MUSER_TRANSPORT defaults
-        # to "tcp" below, unchanged behavior). Read from this host process's
-        # own environment (e.g. the systemd unit's EnvironmentFile) so the
-        # transport can be flipped without editing this file again. Device
-        # nodes are passed through unconditionally (harmless, world-rw on
-        # this host) so a later opt-in does not itself require a restart
-        # for that half of it.
+        # Where segment payloads go; see rdma_settings(). The sender offers
+        # the lane and falls back to inline TLS, loudly, if the receiver
+        # declines.
         "-e",
-        f"MUSER_TRANSPORT={os.environ.get('MUSER_TRANSPORT', 'tcp')}",
+        f"MUSER_TRANSPORT={'rdma' if rdma else 'tcp'}",
         "-e",
-        f"MUSER_RDMA_DEV={os.environ.get('MUSER_RDMA_DEV', 'rocep1s0f1')}",
+        f"MUSER_RDMA_DEV={rdma['device'] if rdma else ''}",
         "-e",
-        f"MUSER_RDMA_GID={os.environ.get('MUSER_RDMA_GID', '2')}",
+        f"MUSER_RDMA_GID={rdma['gid_index'] if rdma else -1}",
         "-e",
-        "MELON_RDMA_PIPE_LIB=/opt/muser/scripts/gx10/llamacpp/libmelon_rdma_pipe.so",
+        "MELON_RDMA_BULK_LIB=/opt/muser/scripts/gx10/llamacpp/libmelon_rdma_bulk.so",
         # Every RDMA registration is locked memory, and docker's default
         # RLIMIT_MEMLOCK in this container is 8 MiB -- the pipe's 16 TX
         # generations (4 MiB) plus its RX ring land exactly on that wall, so
@@ -606,7 +648,7 @@ def start_container(config: dict[str, Any]) -> Path:
         "-v",
         f"{config['work_dir']}:/run/muser/work",
     ]
-    for source, target in runtime_overlay_mounts():
+    for source, target in runtime_overlay_mounts(RDMA_OVERLAY_MOUNTS if rdma else ()):
         command.extend(["-v", f"{source}:{target}:ro"])
     command.extend(
         [
@@ -788,6 +830,7 @@ def validate_producer_receipt(
     transfer_id: str,
     generation: int,
     vllm_commit: str,
+    rdma_configured: bool = False,
 ) -> dict[str, int]:
     if not isinstance(value, dict) or value.get("schema") != CLIENT_RECEIPT_SCHEMA:
         raise NativePrefilldError("native producer client receipt schema differs")
@@ -834,20 +877,24 @@ def validate_producer_receipt(
         or not isinstance(connector_total, int)
         or not isinstance(first_offset, int)
         or not 0 < first_offset <= d2h <= connector_total
-        or handoff.get("payload_wire_source") not in (
-            "linux-tcp-info-busy-time-v1",
-            # RDMA has no TCP_INFO-equivalent kernel counter; melon_rdma_pipe.c's
-            # send() blocks synchronously per operation, so the wall-clock
-            # sendall-blocked measurement it falls back to is exact wire time
-            # for this transport, not an estimate — see muser_v2_send.py's
-            # DeferredHandoffV2Sender.seal(). Only accepted together with
-            # MUSER_TRANSPORT=rdma in this same daemon's own environment,
-            # which os.environ.get() below re-checks independently rather
-            # than trusting the label a compromised producer client could
-            # otherwise forge.
-            "melon-rdma-sendall-blocked-time-v1"
-            if os.environ.get("MUSER_TRANSPORT") == "rdma"
-            else "linux-tcp-info-busy-time-v1",
+        or handoff.get("payload_wire_source")
+        not in (
+            ("linux-tcp-info-busy-time-v1",)
+            # On the bulk lane the TCP socket carried only control frames, so
+            # its kernel busy time says nothing about payload; the lane reports
+            # the union of [post, completion] over its writes instead, from NIC
+            # completion stamps when it has them. Accepted only when this
+            # daemon itself configured the lane, rather than on the strength of
+            # a label the client could write — and a sender whose receiver
+            # declined the lane reports the TCP tag, accepted either way.
+            + (
+                (
+                    "melon-rdma-bulk-nic-busy-time-v1",
+                    "melon-rdma-bulk-reaped-busy-time-v1",
+                )
+                if rdma_configured
+                else ()
+            )
         )
         or not isinstance(handoff.get("segments"), int)
         or handoff["segments"] <= 0
@@ -927,6 +974,7 @@ def run_request(
             transfer_id,
             generation,
             config["vllm_commit"],
+            rdma_settings(config) is not None,
         )
     finally:
         token_path.unlink(missing_ok=True)

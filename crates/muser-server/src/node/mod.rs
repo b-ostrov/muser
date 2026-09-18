@@ -32,6 +32,7 @@ pub mod enroll;
 pub mod model;
 pub mod pki;
 pub mod preflight;
+pub mod rdma;
 pub mod progress;
 pub mod registry;
 pub mod smoke;
@@ -48,7 +49,7 @@ use crate::cli::{NodeAddArgs, NodeArgs, NodeCommand, NodeCommonArgs, NodeStepArg
 use self::artifacts::{ContainerReceipt, NativeIdentity, Release};
 use self::progress::{Progress, Status, Step};
 use self::registry::{
-    NodeEntry, OperationLock, ProducerKind, Registry, DAEMON_PORT, STATE_HEALTHY,
+    NodeEntry, OperationLock, ProducerKind, Registry, DAEMON_PORT, STATE_HEALTHY, TransportKind,
 };
 use self::ssh::Ssh;
 
@@ -71,6 +72,9 @@ pub struct Ctx {
     pub model_source_base: Option<String>,
     pub prompt_fixture: Option<PathBuf>,
     pub lane_dir_override: Option<String>,
+    /// What `--transport` asked of this run; empty for the individual steps,
+    /// which keep whatever lane the node already had.
+    pub rdma_request: rdma::RdmaRequest,
     /// In-process proof that the immediately preceding model stage hashed the
     /// native consumer. `node enroll` run on its own still rehashes; the full
     /// pipeline does not read the same 19.6 GB twice.
@@ -97,6 +101,7 @@ impl Ctx {
             model_source_base: common.model_source_base.clone(),
             prompt_fixture: common.prompt_fixture.clone(),
             lane_dir_override: common.lane_dir.clone(),
+            rdma_request: rdma::RdmaRequest::default(),
             verified_native_consumer: Mutex::new(None),
         })
     }
@@ -288,13 +293,26 @@ fn add(args: NodeAddArgs) -> Result<()> {
         .lane_dir_override
         .as_ref()
         .is_some_and(|lane| lane != &entry.lane_dir);
+    // A transport change rewrites both configs and restarts the producer, so
+    // it can never take the warm fast path.
+    ctx.rdma_request = rdma::RdmaRequest {
+        want: args.transport.map(|transport| transport == TransportKind::Rdma),
+        node_address: args.rdma_node_address.clone(),
+        mac_address: args.rdma_mac_address.clone(),
+    };
+    let transport_changed = ctx
+        .rdma_request
+        .want
+        .is_some_and(|want| want != entry.rdma.is_some())
+        || ctx.rdma_request.node_address.is_some()
+        || ctx.rdma_request.mac_address.is_some();
     if let Some(lane) = &ctx.lane_dir_override {
         ssh::validate_remote_path(lane)?;
         entry.lane_dir = lane.clone();
     }
 
     if !args.repair
-        && fast_rejoin_eligible(&ctx, &entry, producer_changed || lane_changed)?
+        && fast_rejoin_eligible(&ctx, &entry, producer_changed || lane_changed || transport_changed)?
         && fast_rejoin(&ctx, &mut registry, &mut entry, &args.target)?
     {
         return Ok(());
@@ -1032,6 +1050,7 @@ mod tests {
             model_source_base: None,
             prompt_fixture: None,
             lane_dir_override: None,
+            rdma_request: Default::default(),
             verified_native_consumer: Mutex::new(None),
         }
     }

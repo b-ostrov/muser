@@ -1,7 +1,14 @@
-//! mTLS-TCP wire transport. This is the only transport that exists here: the
-//! frames below are written to a TLS 1.3 stream. Release qualification uses
-//! measured installed-payload throughput with a 3.0 Gbps median floor.
-//! RDMA/RoCE is roadmap, not code.
+//! Handoff V2 wire framing. Every frame is written to a TLS 1.3 stream.
+//! Release qualification uses measured installed-payload throughput with a
+//! 3.0 Gbps median floor.
+//!
+//! Segment payloads may instead travel over the MelonDMA bulk lane: a producer
+//! that wants it sends `bulk_offer` before Begin, the receiver answers
+//! `bulk_accept` or `bulk_decline`, and on acceptance each segment header
+//! carries a `bulk` reference and no inline payload. Nothing about what a
+//! payload must hash to changes — the descriptor sha256 and the HMAC seal
+//! still ride this TLS stream — so a lane that is declined, or never offered,
+//! is simply today's inline transfer.
 //!
 //! Source: the audited in-tree `kvpack-handoff` snapshot plus Ferrite's
 //! `main/spark_prefill*` wire framing.
@@ -35,6 +42,35 @@ pub enum WireFrameV2 {
     Abort {
         reason: String,
     },
+    /// Producer -> receiver, before Begin: the producer's bulk-lane endpoint.
+    BulkOffer {
+        endpoint: Vec<u8>,
+    },
+    /// Receiver -> producer: the receiver's endpoint; payloads may now move
+    /// over the lane.
+    BulkAccept {
+        endpoint: Vec<u8>,
+    },
+    /// Receiver -> producer: stay inline, and why.
+    BulkDecline {
+        reason: String,
+    },
+    /// A segment whose payload is in the bulk lane rather than this frame.
+    BulkSegment {
+        sequence: u32,
+        descriptor: Option<SegmentDescriptorV2>,
+        bulk: BulkRefV2,
+    },
+}
+
+/// Where one bulk-lane payload is: the put's index, which must be the next,
+/// and the ring position and length the receiver independently expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkRefV2 {
+    pub index: u32,
+    pub position: u64,
+    pub length: u64,
 }
 
 /// A Begin frame admitted off the wire: the typed manifest plus the delta
@@ -67,6 +103,8 @@ enum Header {
         sequence: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         descriptor: Option<SegmentDescriptorV2>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bulk: Option<BulkRefV2>,
     },
     Seal {
         manifest: SealManifestV2,
@@ -78,6 +116,35 @@ enum Header {
     Abort {
         reason: String,
     },
+    BulkOffer {
+        endpoint: String,
+    },
+    BulkAccept {
+        endpoint: String,
+    },
+    BulkDecline {
+        reason: String,
+    },
+}
+
+fn endpoint_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn endpoint_from_hex(text: &str) -> Result<Vec<u8>, TransportError> {
+    // Endpoints are fixed-size; anything else is not one.
+    if text.len() != 128 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TransportError::Invalid(
+            "bulk endpoint is not 64 hex-encoded bytes".into(),
+        ));
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| {
+            u8::from_str_radix(&text[at..at + 2], 16)
+                .map_err(|_| TransportError::Invalid("bulk endpoint is not hex".into()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +196,7 @@ pub fn write_frame_v2(
             Header::Segment {
                 sequence: *sequence,
                 descriptor: None,
+                bulk: None,
             },
             payload.as_slice(),
         ),
@@ -139,8 +207,39 @@ pub fn write_frame_v2(
             Header::Segment {
                 sequence: descriptor.sequence,
                 descriptor: Some(descriptor.clone()),
+                bulk: None,
             },
             payload.as_slice(),
+        ),
+        WireFrameV2::BulkSegment {
+            sequence,
+            descriptor,
+            bulk,
+        } => (
+            Header::Segment {
+                sequence: *sequence,
+                descriptor: descriptor.clone(),
+                bulk: Some(*bulk),
+            },
+            &[][..],
+        ),
+        WireFrameV2::BulkOffer { endpoint } => (
+            Header::BulkOffer {
+                endpoint: endpoint_hex(endpoint),
+            },
+            &[][..],
+        ),
+        WireFrameV2::BulkAccept { endpoint } => (
+            Header::BulkAccept {
+                endpoint: endpoint_hex(endpoint),
+            },
+            &[][..],
+        ),
+        WireFrameV2::BulkDecline { reason } => (
+            Header::BulkDecline {
+                reason: reason.clone(),
+            },
+            &[][..],
         ),
         WireFrameV2::Seal(manifest) => (
             Header::Seal {
@@ -241,9 +340,48 @@ fn read_frame_v2_after_preamble(
             generation,
         }),
         Header::Abort { reason } if plen == 0 => Ok(WireFrameV2::Abort { reason }),
+        Header::BulkOffer { endpoint } if plen == 0 => Ok(WireFrameV2::BulkOffer {
+            endpoint: endpoint_from_hex(&endpoint)?,
+        }),
+        Header::BulkAccept { endpoint } if plen == 0 => Ok(WireFrameV2::BulkAccept {
+            endpoint: endpoint_from_hex(&endpoint)?,
+        }),
+        Header::BulkDecline { reason } if plen == 0 => Ok(WireFrameV2::BulkDecline { reason }),
         Header::Segment {
             sequence,
             descriptor,
+            bulk: Some(bulk),
+        } => {
+            // The payload is in the lane; an inline one as well would leave
+            // two candidates for the same bytes.
+            if plen != 0 {
+                return Err(TransportError::Invalid(
+                    "bulk segment also carries an inline payload".into(),
+                ));
+            }
+            if bulk.length == 0 || bulk.length > limits.max_payload_bytes as u64 {
+                return Err(TransportError::Invalid(
+                    "bulk segment length exceeds bounds".into(),
+                ));
+            }
+            if descriptor
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.sequence != sequence)
+            {
+                return Err(TransportError::Invalid(
+                    "segment sequence differs from its descriptor".into(),
+                ));
+            }
+            Ok(WireFrameV2::BulkSegment {
+                sequence,
+                descriptor,
+                bulk,
+            })
+        }
+        Header::Segment {
+            sequence,
+            descriptor,
+            bulk: None,
         } => {
             if plen == 0 {
                 return Err(TransportError::Invalid("empty segment".into()));
@@ -320,7 +458,10 @@ const DESCRIPTOR_FIELDS: &[&str] = &[
     "byte_len",
     "sha256",
 ];
-const SEGMENT_FRAME_FIELDS: &[&str] = &["kind", "sequence", "descriptor"];
+const SEGMENT_FRAME_FIELDS: &[&str] = &["kind", "sequence", "descriptor", "bulk"];
+const BULK_REF_FIELDS: &[&str] = &["index", "position", "length"];
+const BULK_ENDPOINT_FRAME_FIELDS: &[&str] = &["kind", "endpoint"];
+const BULK_DECLINE_FRAME_FIELDS: &[&str] = &["kind", "reason"];
 const SEAL_FRAME_FIELDS: &[&str] = &["kind", "manifest"];
 const SEAL_MANIFEST_FIELDS: &[&str] = &["core", "hmac_sha256"];
 const SEAL_CORE_FIELDS: &[&str] = &[
@@ -351,7 +492,16 @@ fn audit_frame_fields(json: &[u8]) -> Result<(), TransportError> {
                     "deferred segment descriptor",
                 )?;
             }
-            Ok(())
+            audit_object(frame.get("bulk"), BULK_REF_FIELDS, "bulk reference")
+        }
+        Some("bulk_offer") => {
+            audit_object(Some(&frame), BULK_ENDPOINT_FRAME_FIELDS, "bulk offer frame")
+        }
+        Some("bulk_accept") => {
+            audit_object(Some(&frame), BULK_ENDPOINT_FRAME_FIELDS, "bulk accept frame")
+        }
+        Some("bulk_decline") => {
+            audit_object(Some(&frame), BULK_DECLINE_FRAME_FIELDS, "bulk decline frame")
         }
         Some("seal") => {
             audit_object(Some(&frame), SEAL_FRAME_FIELDS, "seal frame")?;
@@ -463,6 +613,76 @@ mod tests {
             self.position += count;
             Ok(count)
         }
+    }
+
+    #[test]
+    fn bulk_negotiation_frames_round_trip() {
+        let limits = FrameLimitsV2::default();
+        let endpoint: Vec<u8> = (0..64).collect();
+        for frame in [
+            WireFrameV2::BulkOffer {
+                endpoint: endpoint.clone(),
+            },
+            WireFrameV2::BulkAccept {
+                endpoint: endpoint.clone(),
+            },
+            WireFrameV2::BulkDecline {
+                reason: "no lane".into(),
+            },
+            WireFrameV2::BulkSegment {
+                sequence: 3,
+                descriptor: None,
+                bulk: BulkRefV2 {
+                    index: 3,
+                    position: 4096,
+                    length: 6_815_744,
+                },
+            },
+        ] {
+            let mut wire = Vec::new();
+            write_frame_v2(&mut wire, &frame, limits).unwrap();
+            let back = read_frame_v2(wire.as_slice(), limits).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{frame:?}"));
+        }
+    }
+
+    #[test]
+    fn a_bulk_segment_with_an_inline_payload_is_refused() {
+        // Two candidates for the same bytes is exactly the ambiguity a
+        // verifier must never have to resolve.
+        let bytes = json_frame(
+            serde_json::json!({
+                "kind": "segment",
+                "sequence": 0,
+                "bulk": {"index": 0, "position": 0, "length": 4},
+            }),
+            &[1, 2, 3, 4],
+        );
+        let error = read_frame_v2(bytes.as_slice(), FrameLimitsV2::default()).unwrap_err();
+        assert!(error.to_string().contains("inline payload"), "{error}");
+    }
+
+    #[test]
+    fn a_bulk_endpoint_must_be_exactly_64_bytes() {
+        let bytes = json_frame(
+            serde_json::json!({"kind": "bulk_offer", "endpoint": "abcd"}),
+            &[],
+        );
+        assert!(read_frame_v2(bytes.as_slice(), FrameLimitsV2::default()).is_err());
+    }
+
+    #[test]
+    fn a_bulk_reference_with_an_unknown_field_is_refused() {
+        let bytes = json_frame(
+            serde_json::json!({
+                "kind": "segment",
+                "sequence": 0,
+                "bulk": {"index": 0, "position": 0, "length": 4, "rkey": 7},
+            }),
+            &[],
+        );
+        let error = read_frame_v2(bytes.as_slice(), FrameLimitsV2::default()).unwrap_err();
+        assert!(error.to_string().contains("rkey"), "{error}");
     }
 
     fn json_frame(value: serde_json::Value, payload: &[u8]) -> Vec<u8> {
