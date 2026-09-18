@@ -1,5 +1,13 @@
 # melon-rdma vs TCP, rerun 2026-09-17
 
+> **Corrected 2026-09-18.** The 6.7–7.6% RDMA lead below does not reproduce.
+> Paired on one producer the next day, TCP at 131,008 tokens was 134.47 s,
+> not 143.32 s, and RDMA's advantage is 0.8–1.0% — what the wire arithmetic
+> predicts. The 09-17 TCP arm was systematically slow for a reason not
+> identified; the "~8 s the wire cannot account for" below was that, not the
+> transport. The five fixes and the data-leg numbers stand. See
+> [`melon-rdma-20260918.md`](melon-rdma-20260918.md).
+
 The 2026-08-30 sweep reported the RDMA lane at parity with TCP, within about
 1% either way, and slower at three of six depths. That reading was correct
 for the code as it stood and wrong about the transport. Five separate things
